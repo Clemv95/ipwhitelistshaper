@@ -292,7 +292,7 @@ func (i *IPWhitelistShaper) handleKnockRequest(rw http.ResponseWriter, req *http
 		approvalURLBase, url.QueryEscape(clientIP), url.QueryEscape(token),
 		url.QueryEscape(validationCode), i.config.ExpirationTime)
 
-	message := fmt.Sprintf("Access request from %s\nValidation code: %s\nApprove: %s",
+	message := fmt.Sprintf("Access request from %s\nValidation code: %s\nApprove link: \n```%s```",
 		clientIP, validationCode, approvalLink)
 	i.sendNotification(message)
 
@@ -775,35 +775,69 @@ func (i *IPWhitelistShaper) getRandomWord() string {
 	return i.wordList[r.Intn(len(i.wordList))]
 }
 func (i *IPWhitelistShaper) sendNotification(message string) {
-	if i.config.NotificationURL == "" { return }
+	if i.config.NotificationURL == "" {
+		return
+	}
+
 	go func(msg string, urlStr string, ctx context.Context, pluginName string) {
-		isDiscord := strings.Contains(strings.ToLower(urlStr), "discord.com/api/webhooks")
+		loweredURL := strings.ToLower(urlStr)
+		isDiscord := strings.Contains(loweredURL, "discord.com/api/webhooks")
+		isSlack := strings.Contains(loweredURL, "hooks.slack.com/services")
+
 		var reqBody *bytes.Buffer
 		contentType := "application/x-www-form-urlencoded"
-		if isDiscord {
+
+		switch {
+		case isDiscord:
 			payload := map[string]string{"content": msg}
 			jsonData, err := json.Marshal(payload)
-			if err != nil { fmt.Printf("[%s] ERROR creating Discord JSON payload: %v\n", pluginName, err); return }
+			if err != nil {
+				fmt.Printf("[%s] ERROR creating Discord JSON payload: %v\n", pluginName, err)
+				return
+			}
 			reqBody = bytes.NewBuffer(jsonData)
 			contentType = "application/json"
-		} else {
-			values := url.Values{}; values.Set("message", msg)
+
+		case isSlack:
+			payload := map[string]string{"text": msg}
+			jsonData, err := json.Marshal(payload)
+			if err != nil {
+				fmt.Printf("[%s] ERROR creating Slack payload: %v\n", pluginName, err)
+				return
+			}
+			values := url.Values{}
+			values.Set("payload", string(jsonData))
+			reqBody = bytes.NewBufferString(values.Encode())
+
+		default:
+			values := url.Values{}
+			values.Set("message", msg)
 			reqBody = bytes.NewBufferString(values.Encode())
 		}
+
 		req, err := http.NewRequestWithContext(ctx, "POST", urlStr, reqBody)
-		if err != nil { fmt.Printf("[%s] ERROR creating notification request: %v\n", pluginName, err); return }
+		if err != nil {
+			fmt.Printf("[%s] ERROR creating notification request: %v\n", pluginName, err)
+			return
+		}
+
 		req.Header.Set("Content-Type", contentType)
 		req.Header.Set("User-Agent", "Traefik-IPWhitelistShaper-Plugin")
+
 		client := &http.Client{Timeout: 15 * time.Second}
 		resp, err := client.Do(req)
 		if err != nil {
-			if ctx.Err() == nil { fmt.Printf("[%s] ERROR sending notification to %s: %v\n", pluginName, urlStr, err) }
+			if ctx.Err() == nil {
+				fmt.Printf("[%s] ERROR sending notification to %s: %v\n", pluginName, urlStr, err)
+			}
 			return
 		}
 		defer resp.Body.Close()
+
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 			bodyBytes, _ := ioutil.ReadAll(resp.Body)
-			fmt.Printf("[%s] ERROR Notification webhook %s returned error (Status %d): %s\n", pluginName, urlStr, resp.StatusCode, string(bodyBytes))
+			fmt.Printf("[%s] ERROR Notification webhook %s returned error (Status %d): %s\n",
+				pluginName, urlStr, resp.StatusCode, string(bodyBytes))
 		}
 	}(message, i.config.NotificationURL, i.ctx, i.name)
 }
