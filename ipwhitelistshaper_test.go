@@ -6,7 +6,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/hhftechnology/ipwhitelistshaper"
+	"github.com/Clemv95/ipwhitelistshaper"
 )
 
 func TestIPWhitelistShaper(t *testing.T) {
