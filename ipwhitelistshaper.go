@@ -22,6 +22,18 @@ import (
 	"time"
 )
 
+// Global state management for sharing instances across routes
+var (
+    globalStateMutex sync.Mutex
+    globalInstances  = make(map[string]*sharedInstance)
+)
+
+// sharedInstance wraps the actual middleware with a reference counter
+type sharedInstance struct {
+    middleware *IPWhitelistShaper
+    refCount   int
+}
+
 // Config defines the plugin configuration.
 type Config struct {
 	ExcludedIPs                []string `json:"excludedIPs,omitempty"`
@@ -93,107 +105,150 @@ type IPWhitelistShaper struct {
 	stopChan           chan struct{}      // To signal periodic saver to stop
 }
 
+// sharedMiddleware wraps a shared IPWhitelistShaper instance
+type sharedMiddleware struct {
+    shared     *IPWhitelistShaper
+    next       http.Handler
+    storageKey string
+}
+
+// ServeHTTP delegates to the shared instance but uses its own next handler
+func (s *sharedMiddleware) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
+    // Temporarily swap the next handler
+    originalNext := s.shared.next
+    s.shared.next = s.next
+    s.shared.ServeHTTP(rw, req)
+    s.shared.next = originalNext
+}
+
+
 type sourceRangeChecker struct {
 	ranges []net.IPNet
 }
 
 // New creates a new IPWhitelistShaper middleware
+// New creates a new IPWhitelistShaper middleware or returns a shared instance
 func New(ctx context.Context, next http.Handler, config *Config, name string) (http.Handler, error) {
-	// Validate config
-	if config.StorageEnabled && config.StoragePath == "" {
-		return nil, fmt.Errorf("storagePath must be set when storageEnabled is true")
-	}
-	if config.SaveInterval <= 0 && config.StorageEnabled {
-		config.SaveInterval = 30 // Default if invalid
-	}
-	if config.ExpirationTime <= 0 {
-		config.ExpirationTime = 300 // Default if invalid
-	}
+    // Validate config
+    if config.StorageEnabled && config.StoragePath == "" {
+        return nil, fmt.Errorf("storagePath must be set when storageEnabled is true")
+    }
+    if config.SaveInterval <= 0 && config.StorageEnabled {
+        config.SaveInterval = 30 // Default if invalid
+    }
+    if config.ExpirationTime <= 0 {
+        config.ExpirationTime = 300 // Default if invalid
+    }
 
-	// Initialize the source ranges
-	sourceRanges := []string{"127.0.0.1/32"} // Always allow localhost
-	if config.DefaultPrivateClassSources {
-		sourceRanges = append(sourceRanges, "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")
-	}
-	sourceRanges = append(sourceRanges, config.WhitelistedIPs...)
+    // Create a unique key for this configuration
+    storageKey := config.StoragePath
+    if storageKey == "" {
+        storageKey = "memory-only-" + name
+    }
 
-	checker, err := newSourceRangeChecker(sourceRanges)
-	if err != nil {
-		return nil, fmt.Errorf("error parsing source ranges: %v", err)
-	}
+    // Check if we already have an instance for this storage path
+    globalStateMutex.Lock()
+    defer globalStateMutex.Unlock()
 
-	wordList := []string{
-		"apple", "banana", "cherry", "dog", "elephant", "frog", "giraffe", "house",
-		"igloo", "jacket", "kangaroo", "lemon", "monkey", "notebook", "orange", "penguin",
-		"queen", "rainbow", "strawberry", "tiger", "umbrella", "violin", "watermelon",
-		"xylophone", "yellow", "zebra", "airplane", "beach", "computer", "dolphin",
-	}
+    if shared, exists := globalInstances[storageKey]; exists {
+        // Reuse existing instance
+        shared.refCount++
+        fmt.Printf("[%s] INFO Reusing existing middleware instance (refCount: %d, storageKey: %s)\n", 
+            name, shared.refCount, storageKey)
+        
+        return &sharedMiddleware{
+            shared:     shared.middleware,
+            next:       next,
+            storageKey: storageKey,
+        }, nil
+    }
 
-	// Create context with cancellation for background tasks
-	pluginCtx, cancel := context.WithCancel(ctx)
+    // Create a new instance (first time)
+    fmt.Printf("[%s] INFO Creating new middleware instance (storageKey: %s)\n", name, storageKey)
 
-	middleware := &IPWhitelistShaper{
-		next:               next,
-		name:               name,
-		config:             config,
-		whitelistedIPs:     make(map[string]IPData),
-		pendingApprovals:   make(map[string]IPData),
-		lastRequestedIP:    make(map[string]time.Time),
-		sourceRangeChecker: checker,
-		wordList:           wordList,
-		ctx:                pluginCtx, // Use the cancellable context
-		cancel:             cancel,
-		stopChan:           make(chan struct{}),
-	}
+    // Initialize the source ranges
+    sourceRanges := []string{"127.0.0.1/32"} // Always allow localhost
+    if config.DefaultPrivateClassSources {
+        sourceRanges = append(sourceRanges, "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")
+    }
+    sourceRanges = append(sourceRanges, config.WhitelistedIPs...)
 
-	// Handle storage setup with graceful fallback
-	if config.StorageEnabled {
-		// Try to create the storage directory
-		err := os.MkdirAll(config.StoragePath, 0755)
-		if err != nil {
-			// Check if directory exists but is just not writable
-			if info, statErr := os.Stat(config.StoragePath); statErr == nil && info.IsDir() {
-				// Directory exists but might be read-only
-				fmt.Printf("[%s] WARNING: Storage directory exists but may not be writable: %v\n", name, err)
-				config.storageReadOnly = true
-			} else {
-				// Try using a temporary directory instead
-				tempDir := os.TempDir()
-				tempStoragePath := filepath.Join(tempDir, "ipwhitelistshaper-"+name)
-				fmt.Printf("[%s] WARNING: Cannot use configured storage path. Using temporary directory for storage: %s\n", 
-					name, tempStoragePath)
-				config.StoragePath = tempStoragePath
-				
-				// Try creating the temp directory
-				if err := os.MkdirAll(config.StoragePath, 0755); err != nil {
-					fmt.Printf("[%s] WARNING: Cannot create storage directory: %v. Operating in memory-only mode.\n", name, err)
-					// Operate in memory-only mode, but still try to load existing data
-					config.storageReadOnly = true
-				}
-			}
-		}
+    checker, err := newSourceRangeChecker(sourceRanges)
+    if err != nil {
+        return nil, fmt.Errorf("error parsing source ranges: %v", err)
+    }
 
-		// Try to load state regardless of write permissions
-		if err = middleware.loadState(); err != nil && !os.IsNotExist(err) {
-			fmt.Printf("[%s] WARNING: Could not load initial state from %s: %v\n", name, config.StoragePath, err)
-		} else if err == nil {
-			fmt.Printf("[%s] INFO Initial state loaded successfully from %s.\n", name, config.StoragePath)
-		}
+    wordList := []string{
+        "apple", "banana", "cherry", "dog", "elephant", "frog", "giraffe", "house",
+        "igloo", "jacket", "kangaroo", "lemon", "monkey", "notebook", "orange", "penguin",
+        "queen", "rainbow", "strawberry", "tiger", "umbrella", "violin", "watermelon",
+        "xylophone", "yellow", "zebra", "airplane", "beach", "computer", "dolphin",
+    }
 
-		// Only start background tasks if we have write permissions
-		if !config.storageReadOnly {
-			go middleware.periodicStateSaving()
-			go middleware.cleanupExpiredEntries()
-			fmt.Printf("[%s] INFO Started background tasks for state management.\n", name)
-		} else {
-			fmt.Printf("[%s] WARNING: Storage is in read-only mode. State will not be persisted.\n", name)
-		}
-	} else {
-		fmt.Printf("[%s] INFO Storage is disabled. Operating in memory-only mode.\n", name)
-	}
+    // Create context with cancellation for background tasks
+    pluginCtx, cancel := context.WithCancel(ctx)
 
-	return middleware, nil
+    middleware := &IPWhitelistShaper{
+        next:               next,
+        name:               name,
+        config:             config,
+        whitelistedIPs:     make(map[string]IPData),
+        pendingApprovals:   make(map[string]IPData),
+        lastRequestedIP:    make(map[string]time.Time),
+        sourceRangeChecker: checker,
+        wordList:           wordList,
+        ctx:                pluginCtx,
+        cancel:             cancel,
+        stopChan:           make(chan struct{}),
+    }
+
+    // Handle storage setup with graceful fallback
+    if config.StorageEnabled {
+        err := os.MkdirAll(config.StoragePath, 0755)
+        if err != nil {
+            if info, statErr := os.Stat(config.StoragePath); statErr == nil && info.IsDir() {
+                fmt.Printf("[%s] WARNING: Storage directory exists but may not be writable: %v\n", name, err)
+                config.storageReadOnly = true
+            } else {
+                tempDir := os.TempDir()
+                tempStoragePath := filepath.Join(tempDir, "ipwhitelistshaper-"+name)
+                fmt.Printf("[%s] WARNING: Cannot use configured storage path. Using temporary directory: %s\n", 
+                    name, tempStoragePath)
+                config.StoragePath = tempStoragePath
+                
+                if err := os.MkdirAll(config.StoragePath, 0755); err != nil {
+                    fmt.Printf("[%s] WARNING: Cannot create storage directory: %v. Operating in memory-only mode.\n", name, err)
+                    config.storageReadOnly = true
+                }
+            }
+        }
+
+        if err = middleware.loadState(); err != nil && !os.IsNotExist(err) {
+            fmt.Printf("[%s] WARNING: Could not load initial state from %s: %v\n", name, config.StoragePath, err)
+        } else if err == nil {
+            fmt.Printf("[%s] INFO Initial state loaded successfully from %s.\n", name, config.StoragePath)
+        }
+
+        if !config.storageReadOnly {
+            go middleware.periodicStateSaving()
+            go middleware.cleanupExpiredEntries()
+            fmt.Printf("[%s] INFO Started background tasks for state management.\n", name)
+        } else {
+            fmt.Printf("[%s] WARNING: Storage is in read-only mode. State will not be persisted.\n", name)
+        }
+    } else {
+        fmt.Printf("[%s] INFO Storage is disabled. Operating in memory-only mode.\n", name)
+    }
+
+    // Store in global registry
+    globalInstances[storageKey] = &sharedInstance{
+        middleware: middleware,
+        refCount:   1,
+    }
+
+    return middleware, nil
 }
+
 
 // ServeHTTP implements the http.Handler interface for the middleware
 func (i *IPWhitelistShaper) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
